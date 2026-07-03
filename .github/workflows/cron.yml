@@ -1,12 +1,18 @@
 ---
-name: Trivy DB
+name: Trivy DB (RapidFort superset)
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    # :30 past every 6th hour, offset from vuln-list-update (:00) so this build
+    # pulls fresh rapidfort JSON that vuln-list-update's run just committed.
+    - cron: "30 */6 * * *"
   workflow_dispatch:
 env:
-  REPO_OWNER: ${{ github.repository_owner }} # used in 'make db-build'
-  GH_USER: aqua-bot
+  # Upstream data lives at aquasecurity/vuln-list*, not under our fork's owner.
+  # `make db-fetch-vuln-list` reads REPO_OWNER, so this pins fetches to upstream.
+  REPO_OWNER: aquasecurity
+  # Your own RapidFort data repo (populated by vuln-list-update's rapidfort target).
+  RAPIDFORT_DATA_OWNER: ${{ github.repository_owner }}
+  RAPIDFORT_DATA_REPO: vuln-list-trivy-rf
   VERSION: 2
 permissions:
   contents: read
@@ -46,6 +52,36 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: make db-fetch-langs db-fetch-vuln-list
 
+      - name: Overlay RapidFort advisories onto vuln-list/
+        # Downloads github.com/<owner>/vuln-list-trivy-rf and copies its `rapidfort/`
+        # subtree into cache/vuln-list/rapidfort/ so trivy-db's rapidfort vulnsrc
+        # picks it up alongside every upstream source. Fails loudly if the data
+        # repo has no rapidfort/ tree — that would silently produce a rapidfort-less
+        # DB, which is a superset-invariant violation.
+        run: |
+          set -euo pipefail
+          tarball="/tmp/vlrf.tar.gz"
+          extract="/tmp/vlrf-extract"
+
+          curl -sL --fail \
+            "https://github.com/${{ env.RAPIDFORT_DATA_OWNER }}/${{ env.RAPIDFORT_DATA_REPO }}/archive/main.tar.gz" \
+            -o "${tarball}"
+          mkdir -p "${extract}"
+          tar -xzf "${tarball}" -C "${extract}" --strip-components=1
+
+          if [ ! -d "${extract}/rapidfort" ]; then
+            echo "ERROR: ${{ env.RAPIDFORT_DATA_OWNER }}/${{ env.RAPIDFORT_DATA_REPO }} has no rapidfort/ directory."
+            echo "Did the vuln-list-update workflow run at least once? Aborting."
+            exit 1
+          fi
+
+          cp -r "${extract}/rapidfort" cache/vuln-list/rapidfort
+
+          echo "cache/vuln-list/ contents after overlay:"
+          ls -la cache/vuln-list/
+          echo "cache/vuln-list/rapidfort/ contents:"
+          ls -la cache/vuln-list/rapidfort/
+
       - name: Build the binary
         run: make build
 
@@ -61,77 +97,33 @@ jobs:
       - name: Move DB
         run: mv assets/db.tar.gz .
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Login to GitHub Packages Container registry
         uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           registry: ghcr.io
-          username: ${{ env.GH_USER }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to ECR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        with:
-          registry: public.ecr.aws
-          username: ${{ secrets.ECR_ACCESS_KEY_ID }}
-          password: ${{ secrets.ECR_SECRET_ACCESS_KEY }}
 
       - name: Install oras
         run: |
           curl -LO https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz
           tar -xvf ./oras_1.2.0_linux_amd64.tar.gz
 
-      - name: Upload assets to registries
+      - name: Push DB to GHCR
+        # Publishes ghcr.io/<owner>/trivy-db under two tags:
+        #   :latest         — floating pointer to newest build
+        #   :${VERSION}     — schema version tag (currently :2). Trivy's DefaultGHCRRepository
+        #                     includes ":2" — trivy-rf/pkg/db/db.go must match this.
         run: |
-          lowercase_repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "Starting artifact upload process..."
+          set -euo pipefail
+          repo="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "Publishing to ${repo} with tags: latest, ${{ env.VERSION }}"
 
-          # Define an array of registry base URLs and their corresponding repository names
-          declare -A registries=(
-            ["ghcr.io"]="${lowercase_repo}"
-            ["public.ecr.aws"]="${lowercase_repo}"
-            ["docker.io"]="${lowercase_repo}"
-          )
-
-          # Special case for docker.io if the organization is 'aquasecurity'
-          if [[ "${lowercase_repo}" == "aquasecurity/"* ]]; then
-            registries["docker.io"]="aquasec/${lowercase_repo#aquasecurity/}"
-            echo "Docker Hub repository adjusted for aquasecurity: ${registries["docker.io"]}"
-          fi
-
-          # Loop through each registry and push the artifact
-          for registry in "${!registries[@]}"; do
-            repo_name=${registries[$registry]}
-            full_registry_url="${registry}/${repo_name}"
-            echo "Processing registry: ${full_registry_url}"
-
-            tags=(latest ${{ env.VERSION }})
-            for tag in "${tags[@]}"; do
-              echo "Pushing artifact with tag: ${tag}"
-
-              if ./oras push --artifact-type application/vnd.aquasec.trivy.config.v1+json \
-                "${full_registry_url}:${tag}" \
-                db.tar.gz:application/vnd.aquasec.trivy.db.layer.v1.tar+gzip; then
-                echo "Successfully pushed to ${full_registry_url}:${tag}"
-              else
-                echo "Failed to push to ${full_registry_url}:${tag}"
-                exit 1
-              fi
-            done
+          for tag in latest ${{ env.VERSION }}; do
+            echo "Pushing ${repo}:${tag}..."
+            ./oras push \
+              --artifact-type application/vnd.aquasec.trivy.config.v1+json \
+              "${repo}:${tag}" \
+              db.tar.gz:application/vnd.aquasec.trivy.db.layer.v1.tar+gzip
+            echo "Pushed ${repo}:${tag}"
           done
-            
-          echo "Artifact upload process completed."
-
-      - name: Microsoft Teams Notification
-        uses: Skitionek/notify-microsoft-teams@e7a2493ac87dad8aa7a62f079f295e54ff511d88
-        if: failure()
-        with:
-          webhook_url: ${{ secrets.TRIVY_MSTEAMS_WEBHOOK }}
-          needs: ${{ toJson(needs) }}
-          job: ${{ toJson(job) }}
-          steps: ${{ toJson(steps) }}
