@@ -240,14 +240,19 @@ func buildAdvisory(cve CVEEntry) types.Advisory {
 	return adv
 }
 
+// eventToConstraint emits constraints in the "no space between op and version"
+// form because trivy-rf's version.NewConstraints splits on whitespace when no
+// comma is present (see pkg/detector/ospkg/version/constraint.go splitConstraints).
+// A single-range constraint like ">= X" would otherwise be misread as two tokens
+// and rejected, causing the CVE to be silently marked not-vulnerable.
 func eventToConstraint(ev Event) string {
 	switch {
 	case ev.Introduced != "" && ev.Fixed != "":
-		return fmt.Sprintf(">= %s, < %s", ev.Introduced, ev.Fixed)
+		return fmt.Sprintf(">=%s, <%s", ev.Introduced, ev.Fixed)
 	case ev.Introduced != "":
-		return fmt.Sprintf(">= %s", ev.Introduced)
+		return fmt.Sprintf(">=%s", ev.Introduced)
 	case ev.Fixed != "":
-		return fmt.Sprintf("< %s", ev.Fixed)
+		return fmt.Sprintf("<%s", ev.Fixed)
 	}
 	return ""
 }
